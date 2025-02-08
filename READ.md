@@ -1,3 +1,6 @@
+### requirement
+pytorch version >= 2.0 # to use flash attention
+
 
 ### first, prepare the openwebtext dataset
 ```sh

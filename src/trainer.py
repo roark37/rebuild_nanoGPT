@@ -5,10 +5,20 @@ import time
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from dataloader import DataLoaderLite, DataLoader
 
 class TrainerConfig:
+
+    # device and environment
+    world_size=1
+    rank=0
+    local_rank=0
+    master=True
+    device='cpu'
+    device_type='cpu'
+
     # lr schedule params
+    ft_lr = 3e-5  # constant learning rate when lr_decay is False
+    lr_decay = True
     max_lr = 6e-4
     min_lr = 0.1 * max_lr
     max_steps = 5000      # 19073
@@ -21,14 +31,7 @@ class TrainerConfig:
     with open(log_file, 'w') as f:
         pass
     
-    def __init__(self, world_size=1, rank=0, local_rank=0, master=True, 
-                 device='cpu', device_type='cpu', **kwargs):
-        self.world_size = world_size
-        self.rank = rank
-        self.local_rank = local_rank
-        self.device = device
-        self.master = master
-        self.device_type = device_type
+    def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
 
@@ -37,17 +40,17 @@ class TrainerConfig:
 
 
 class Trainer():
-    def __init__(self, model, optimizer, config, ckpt_path=None):
+    def __init__(self, model, optimizer, dataloader, config, ckpt_path=None):
         self.ckpt_path = ckpt_path
         self.optimizer = optimizer
         self.config = config
-        self.train_loader = DataLoader(config.B, config.T, 
+        self.train_loader = dataloader(config.B, config.T, 
                                        proc_rank=config.rank, 
                                        nproc=config.world_size, 
                                        mode='train',
                                        is_master=config.master
                                        )
-        self.val_loader = DataLoader(config.B, config.T, 
+        self.val_loader = dataloader(config.B, config.T, 
                                      proc_rank=config.rank, 
                                      nproc=config.world_size, 
                                      mode='val',
@@ -127,7 +130,13 @@ class Trainer():
                 x, y = self.train_loader.next_batch()
             else:
                 x, y = self.val_loader.next_batch()
-            x, y = x.to(self.config.device), y.to(self.config.device)
+            
+            if self.config.device_type == 'cuda':
+                # pin x, y, which allows to move them to GPU asynchronously
+                x = x.pin_memory().to(self.config.device, non_blocking=True)
+                y = y.pin_memory().to(self.config.device, non_blocking=True)
+            else:
+                x, y = x.to(self.config.device), y.to(self.config.device)
 
             with torch.autocast(device_type=self.config.device_type, dtype=torch.bfloat16):
                 logits, loss = self.model(x, y)
@@ -151,7 +160,7 @@ class Trainer():
             # should be the same to use 'self.raw_model.parameters()' as the argument
 
             # gradient update
-            lr = self._get_lr(step_idx)
+            lr = self._get_lr(step_idx) if self.config.lr_decay else self.config.ft_lr
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
             self.optimizer.step()
@@ -189,8 +198,11 @@ class Trainer():
                 
                     # write model checkpoints
                     ckpt_path = os.path.join(config.log_dir, f'model_{step_i:05d}.pt')
-                    shard_idx = self.train_loader.curr_shard_idx
-                    inshard_posi = self.train_loader.curr_posi
+                    if self.train_loader.data_root == '../data/edu_fineweb10B':
+                        shard_idx = self.train_loader.curr_shard_idx
+                        inshard_posi = self.train_loader.curr_posi
+                    else:
+                        shard_idx = inshard_posi = None
                     self._save_checkpoint(ckpt_path, step_i, shard_idx, inshard_posi, loss_accum)    
 
             # one step of optimization

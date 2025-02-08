@@ -3,6 +3,55 @@ import torch
 import numpy as np
 import os
 
+# the base class for dataloaders
+class DataLoader():
+    def __init__(self, B, T, proc_rank, nproc, mode):
+        self.batch_size = B
+        self.seq_len = T
+        self.proc_rank=proc_rank
+        self.nproc=nproc
+        assert mode in {'train', 'val'}
+        self.mode = mode
+
+    def reset_starting_point(self, shard=None, posi=None):
+        """
+        this method can be overrided in the child class.
+        """
+        pass
+
+    def next_batch(self):
+        """
+        need to be implemented in the child class
+        """
+        raise NotImplementedError("Must implement next_batch!")
+        
+        
+# dataloader for OpenWebText dataset
+class OWDataLoader(DataLoader):
+    def __init__(self, B, T, proc_rank, nproc, mode, is_master=False):
+        super().__init__(B, T, proc_rank, nproc, mode)
+
+        self.data_root = '../data/openwebtext/'
+        if mode == 'train':
+            data_path = os.path.join(self.data_root, 'train.bin')
+        elif mode == 'val':
+            data_path = os.path.join(self.data_root, 'val.bin')
+        else:
+            raise ValueError("Wrong type of mode! choose from 'train' and 'val'!")
+
+        self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+     
+    def next_batch(self):
+        # random sample index
+        idx = torch.randint(len(self.data) - self.seq_len, (self.batch_size, ))
+        x = [torch.from_numpy((self.data[i: i+self.seq_len]).astype(np.int64)) for i in idx]
+        x = torch.stack(x, dim=0)
+        y = [torch.from_numpy((self.data[i+1: i+1+self.seq_len]).astype(np.int64)) for i in idx]
+        y = torch.stack(y, dim=0)        
+
+        return x, y
+        
+
 # load one shard of data and convert it to pytorch tensor
 def load_tokens(file_name):
     np_ar = np.load(file_name)
@@ -11,24 +60,20 @@ def load_tokens(file_name):
     return pt_tensor
 
 ## dataloader for FineWeb-EDU dataset
-class DataLoader():
+class FWDataLoader(DataLoader):
     def __init__(self, B, T, proc_rank, nproc, mode, is_master=False):
-        self.batch_size = B
-        self.seq_len = T
-        self.proc_rank=proc_rank
-        self.nproc=nproc
-        assert mode in {'train', 'val'}
+        super().__init__(B, T, proc_rank, nproc, mode)
 
         # get the shard filenames
-        data_root = '../data/edu_fineweb10B'
-        shards = os.listdir(data_root) # 返回指定的文件夹包含的文件名\文件夹名列表
-        shards = [s for s in shards if mode in s]
+        self.data_root = '../data/edu_fineweb10B'
+        shards = os.listdir(self.data_root) # 返回指定的文件夹包含的文件名\文件夹名列表
+        shards = [s for s in shards if self.mode in s]
         shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
+        shards = [os.path.join(self.data_root, s) for s in shards]
         self.shards = shards
-        assert len(self.shards) > 0, f'no shards found for {mode}'
+        assert len(self.shards) > 0, f'no shards found for {self.mode}'
         if is_master:
-            print(f'found {len(self.shards)} shards for {mode}')
+            print(f'found {len(self.shards)} shards for {self.mode}')
 
         self.reset_starting_point()
 
@@ -54,12 +99,9 @@ class DataLoader():
 
 
 ## dataloader for shakespeare txt in 'data/input.txt'
-class DataLoaderLite():
-    def __init__(self, B, T, proc_rank, nproc):
-        self.batch_size = B
-        self.seq_len = T
-        self.proc_rank=proc_rank
-        self.nproc=nproc
+class SPDataLoader():
+    def __init__(self, B, T, proc_rank, nproc, mode='train'):
+        super().__init__(B, T, proc_rank, nproc, mode)
 
         with open('../data/input.txt', 'r') as f:
             text = f.read()

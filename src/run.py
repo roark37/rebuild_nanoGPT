@@ -4,37 +4,40 @@ import tiktoken
 import torch
 from torch.distributed import init_process_group, destroy_process_group
 
-from gpt_model import GPTConfig, GPT
+from gpt_model import GPTConfig, OptConfig, GPT
 from trainer import TrainerConfig, Trainer
 from eval_hellaswag import predict
 from sample_utils import generate_samples
+from dataloader import FWDataLoader, OWDataLoader
 
 # when using ddp, use torchrun:
 # for pretrain:
 # torchrun --standalone --nproc_per_node=1 run.py pretrain \
+#          --train_data openwebtext \
 #          --writing_params_path pretrain.params
 
 # torchrun --standalone --nproc_per_node=1 run.py pretrain \
 #          --writing_params_path pretrain.params \
 #          --ckpt_path ../log/model_00499.pt
 
-# for generate:
-# torchrun --standalone --nproc_per_node=1 run.py generate \
-#          --reading_params_path pretrain.params
-
 # for evaluate:
 # torchrun --standalone --nproc_per_node=1 run.py evaluate \
 #          --reading_params_path pretrain.params
 
-## ------------ CommandLine parsing ------------
+# for generate:
+# torchrun --standalone --nproc_per_node=1 run.py generate \
+#          --reading_params_path pretrain.params
+
+
+## -------------------- CommandLine parsing --------------------
 argp = argparse.ArgumentParser()
 
 argp.add_argument('function', default='pretrain', 
                   help="Choose pretrain, finetune, evaluate or generate")
 
-argp.add_argument('--train_data_path', default=None)
-argp.add_argument('--ft_data_path', default=None)
-argp.add_argument('--eval_data_path', default=None)
+argp.add_argument('--train_data', default='openwebtext') #  or 'fineweb-edu'
+argp.add_argument('--ft_data', default=None)
+argp.add_argument('--eval_data', default=None)
 
 argp.add_argument('--writing_params_path', default=None, 
                   help="specify a file to save model.state_dict")
@@ -45,7 +48,7 @@ argp.add_argument('--ckpt_path', default=None,
 args = argp.parse_args()
 
 
-## ------------ Device & Environment setting ------------
+## ---------------- Device & Environment setting ----------------
 ddp = int(os.environ.get('RANK', -1)) > -1
 print(f'ddp is activated: {ddp}')
 if ddp:
@@ -68,23 +71,37 @@ else:
     print(f'using device: {device}')
 
 
-## ------------ Construct Model ------------
-#  Default model setting (ref to GPT2) is as follows:
+## ------------- Model and Opitmizer Configuration -------------
+#  Default Model setting (ref to GPT2) is as follows:
 #  - @vocab_size: int = 50257  # number of tokens
 #  - @block_size: int = 1024   # max sequence length
 #  - @n_layer: int = 12        # number of layers
 #  - @n_head: int = 12         # number of heads
 #  - @n_embd: int = 768        # embedding dimension
+#  - @dropout: float = 0.1     # AK suggest: 0.0 for pretrain, 0.1 for finetune
+#  - @bias: bool = True        # none zero bias
 #  - @flash: bool = False      # flag of flash attention
-vocab_size = 50304  # 50304 % 128 == 0, it's better than 50257
+
+vocab_size = 50304  # 50304 % 128 == 0, it's better than 50257 @GPT2
 flash_flag = True
 model_config = GPTConfig(flash=flash_flag, vocab_size=vocab_size)
+
+#  Default Optimizer setting (ref to GPT2) is as follows:
+#  - @weight_decay: float = 0.1    # coefficient of weight decay
+#  - @beta1: float = 0.9
+#  - @beta2: float = 0.95
+#  - @eps: float = 1e-8
+#  - @device_type: str = 'cpu'     # need to be specified if cuda is used
+
+opt_config = OptConfig(device_type=device_type)
+
+## -------------------- Model Construction --------------------
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-model = GPT(model_config)
+model = GPT(model_config, opt_config)
 model.to(device)
 model = torch.compile(model)
 
@@ -95,16 +112,19 @@ model = torch.compile(model)
 ## ------------ Perform pretraining ------------
 def check_file_path(writing_params=None,
                     reading_params=None,
+                    train_data=None,
                     eval_data=None,
                     ft_data=None,):
     if writing_params:
         assert args.writing_params_path is not None, 'specify a file to save params!'
     if reading_params:
         assert args.reading_params_path is not None, 'no params file!'
+    if train_data:
+        assert args.train_data is not None, 'specify the pretrain data set!'
     if ft_data:
-        assert args.ft_data_path is not None, 'specify a FT data path!'
+        assert args.ft_data is not None, 'specify the FT data set!'
     if eval_data:
-        assert args.eval_data_path is not None, 'specify a evaluation data path!'
+        assert args.eval_data is not None, 'specify the evaluation data set!'
 
 
 if args.function == 'pretrain':
@@ -113,12 +133,22 @@ if args.function == 'pretrain':
     Careful! don't restart after all steps are finished, because
     the learning rate schedule would not match.
     """
-    check_file_path(writing_params=True)
+    check_file_path(writing_params=True, train_data=True)
 
-    optimizer = model.configure_optimizer(weight_decay=0.1, lr=64-4, device_type=device_type)
+    optimizer = model.configure_optimizer()
 
     #  Setting in TrainerConfig (ref to GPT2) is as follows:
+    #  - device and environment
+    #    @world_size=1
+    #    @rank=0
+    #    @local_rank=0
+    #    @master=True
+    #    @device='cpu'
+    #    @device_type='cpu'
+    #
     #  - lr schedule:
+    #    @ft_lr = 3e-5      # constant learning rate when lr_decay is False
+    #    @lr_decay = True   # set this as False in finetuning
     #    @max_lr = 6e-4
     #    @min_lr = 0.1 * max_lr
     #    @warmup_steps = 715
@@ -140,8 +170,18 @@ if args.function == 'pretrain':
                                  device_type = device_type,
                                  master=master_process,
                                 )
-    ckpt_path = args.ckpt_path
-    gpt_trainer = Trainer(model, optimizer, train_config, ckpt_path=ckpt_path)
+    
+    dataset = args.train_data
+    if dataset == 'openwebtext':
+        dataloader = OWDataLoader
+    elif dataset == 'fineweb-edu':
+        dataloader = FWDataLoader
+    else:
+        raise ValueError('only the openwebtext and fineweb-edu is supported')
+    
+    ckpt_path = args.ckpt_path    
+    gpt_trainer = Trainer(model, optimizer, dataloader, 
+                          train_config, ckpt_path=ckpt_path)
     gpt_trainer.train()
 
     # save model
@@ -155,7 +195,7 @@ elif args.function == 'finetune':
                     ft_data=True)    
 
     model.load_state_dict(torch.load(args.reading_params_path))
-    ft_optimizer = model.configure_optimizer(weight_decay=0.1, lr=64-4, device_type=device_type)
+    ft_optimizer = model.configure_optimizer()
 
     ###  need to rebuild a data loader here!  ### 
     pass
