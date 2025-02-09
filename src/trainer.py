@@ -21,8 +21,8 @@ class TrainerConfig:
     lr_decay = True
     max_lr = 6e-4
     min_lr = 0.1 * max_lr
-    max_steps = 5000      # 19073
-    warmup_steps = 200     # 715
+    max_steps = 100      # 19073
+    warmup_steps = 20     # 715
 
     # file path for saving and loading
     log_dir = '../log'     # directory for log file and checkpoint files
