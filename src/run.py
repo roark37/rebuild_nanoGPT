@@ -7,7 +7,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from gpt_model import GPTConfig, OptConfig, GPT
 from trainer import TrainerConfig, Trainer
 from eval_hellaswag import predict
-from sample_utils import generate_samples
+from utils import generate_samples
 from dataloader import FWDataLoader, OWDataLoader
 
 # when using ddp, use torchrun:

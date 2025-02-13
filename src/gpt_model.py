@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from utils import RMSNorm
 
 @dataclass
 class GPTConfig:
@@ -76,7 +77,7 @@ class CausalSelfAttention(nn.Module):
         if self.flash:
             y = F.scaled_dot_product_attention(q, k, v, 
                                                dropout_p=self.dropout if self.training else 0, 
-                                               is_causal=True) 
+                                               is_causal=True) # better to set dropout manually here
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))        
